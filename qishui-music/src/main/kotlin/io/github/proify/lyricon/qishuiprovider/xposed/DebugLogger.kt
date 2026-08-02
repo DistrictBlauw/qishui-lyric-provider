@@ -1,5 +1,6 @@
 package io.github.proify.lyricon.qishuiprovider.xposed
 
+import android.os.Environment
 import android.util.Log
 import de.robv.android.xposed.XposedBridge
 import java.io.BufferedWriter
@@ -21,25 +22,8 @@ import java.util.concurrent.atomic.AtomicReference
 /**
  * 汽水歌词提供器统一日志系统。
  *
- * 设计目标：
- * - 分级输出（VERBOSE / DEBUG / INFO / WARN / ERROR）
- * - 三通道：LSPosed([XposedBridge]) + logcat + 可选文件
- * - 异步写文件，避免阻塞 Hook 线程
- * - 线程安全；文件超过上限自动轮转保留一份备份
- * - 字节系应用可能劫持 [Log]，因此 [XposedBridge] 为主通道
- *
- * 文件候选路径（按优先级）：
- * 1. `/sdcard/qishui-lyric-debug.log`
- * 2. `{externalCacheDir}/qishui-lyric-debug.log`
- * 3. `{cacheDir}/qishui-lyric-debug.log`
- *
- * 用法：
- * ```
- * DebugLogger.init(cacheDir, externalCacheDir)
- * DebugLogger.d("QiShui", "hook installed")
- * DebugLogger.e("QiShui", "failed", throwable)
- * DebugLogger.log("QiShui", "compat info") // 兼容旧 API，等价 INFO
- * ```
+ * 三通道：LSPosed([XposedBridge]) + logcat + 文件。
+ * 文件优先写到用户可见目录（Download / 外部存储），失败再回退应用缓存。
  */
 object DebugLogger {
 
@@ -47,9 +31,9 @@ object DebugLogger {
 
     private const val FILE_NAME = "qishui-lyric-debug.log"
     private const val BACKUP_FILE_NAME = "qishui-lyric-debug.log.1"
-    private const val MAX_LOG_SIZE = 2L * 1024 * 1024 // 2MB
-    private const val QUEUE_CAPACITY = 512
-    private const val FLUSH_INTERVAL_MS = 1_000L
+    private const val MAX_LOG_SIZE = 2L * 1024 * 1024
+    private const val QUEUE_CAPACITY = 1024
+    private const val FLUSH_INTERVAL_MS = 300L
 
     enum class Level(val priority: Int, val label: String) {
         VERBOSE(0, "V"),
@@ -61,7 +45,6 @@ object DebugLogger {
         fun isAtLeast(min: Level): Boolean = priority >= min.priority
     }
 
-    /** 最低输出级别，低于此级别的日志直接丢弃。默认 DEBUG。 */
     @Volatile
     var minLevel: Level = Level.DEBUG
 
@@ -74,9 +57,17 @@ object DebugLogger {
     @Volatile
     var enableFile: Boolean = true
 
+    /** 每条文件日志立即 flush，便于现场排查（略损性能）。 */
+    @Volatile
+    var forceFlushEachLine: Boolean = true
+
     private val appCacheDirRef = AtomicReference<File?>(null)
     private val appExternalCacheDirRef = AtomicReference<File?>(null)
+    private val appFilesDirRef = AtomicReference<File?>(null)
+    private val appExternalFilesDirRef = AtomicReference<File?>(null)
+    private val packageNameRef = AtomicReference<String?>(null)
     private val resolvedFile = AtomicReference<File?>(null)
+    private val resolveFailedOnce = AtomicBoolean(false)
 
     private val started = AtomicBoolean(false)
     private val queue = LinkedBlockingQueue<String>(QUEUE_CAPACITY)
@@ -96,24 +87,31 @@ object DebugLogger {
             SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.US)
     }
 
-    // region Public API
-
-    /**
-     * 注入应用缓存目录，应在 Provider 初始化时调用一次。
-     * 可重复调用；目录变化时会重置文件解析。
-     */
-    fun init(cacheDir: File?, externalCacheDir: File? = null) {
+    fun init(
+        cacheDir: File?,
+        externalCacheDir: File? = null,
+        filesDir: File? = null,
+        externalFilesDir: File? = null,
+        packageName: String? = null
+    ) {
         appCacheDirRef.set(cacheDir)
         appExternalCacheDirRef.set(externalCacheDir)
+        appFilesDirRef.set(filesDir)
+        appExternalFilesDirRef.set(externalFilesDir)
+        if (!packageName.isNullOrBlank()) packageNameRef.set(packageName)
         resolvedFile.set(null)
+        resolveFailedOnce.set(false)
         ensureWriterStarted()
-        i("Logger", "init cacheDir=$cacheDir, externalCacheDir=$externalCacheDir")
+        // 同步探测一次，把路径立刻打到 Xposed 日志，方便用户在 LSPosed 里看到
+        val path = resolveLogFile()?.absolutePath
+        i("Logger", "init package=$packageName cacheDir=$cacheDir externalCacheDir=$externalCacheDir logPath=$path")
+        if (path == null) {
+            e("Logger", "FILE LOG UNAVAILABLE: all candidate paths failed; use LSPosed log tag QishuiLyric")
+        }
+        flush()
     }
 
-    /**
-     * 兼容旧代码：`DebugLogger.appCacheDir = context.cacheDir`
-     */
-    @Deprecated("Use init(cacheDir, externalCacheDir)", ReplaceWith("init(appCacheDir, appExternalCacheDir)"))
+    @Deprecated("Use init(...)", ReplaceWith("init(appCacheDir, appExternalCacheDir)"))
     var appCacheDir: File?
         get() = appCacheDirRef.get()
         set(value) {
@@ -122,10 +120,7 @@ object DebugLogger {
             ensureWriterStarted()
         }
 
-    /**
-     * 兼容旧代码：`DebugLogger.appExternalCacheDir = context.externalCacheDir`
-     */
-    @Deprecated("Use init(cacheDir, externalCacheDir)", ReplaceWith("init(appCacheDir, appExternalCacheDir)"))
+    @Deprecated("Use init(...)", ReplaceWith("init(appCacheDir, appExternalCacheDir)"))
     var appExternalCacheDir: File?
         get() = appExternalCacheDirRef.get()
         set(value) {
@@ -139,9 +134,6 @@ object DebugLogger {
     fun w(tag: String, msg: String, t: Throwable? = null) = log(Level.WARN, tag, msg, t)
     fun e(tag: String, msg: String, t: Throwable? = null) = log(Level.ERROR, tag, msg, t)
 
-    /**
-     * 兼容旧 API：等价于 [i]。
-     */
     @JvmOverloads
     fun log(tag: String = "QiShui", msg: String, t: Throwable? = null) {
         i(tag, msg, t)
@@ -154,48 +146,31 @@ object DebugLogger {
         val header = "[$safeTag] $msg"
         val stack = t?.stackTraceToString()
 
-        if (enableXposedBridge) {
-            writeXposed(level, header, t)
-        }
-        if (enableLogcat) {
-            writeLogcat(level, header, t)
-        }
-        if (enableFile) {
-            enqueueFile(level, safeTag, msg, stack)
-        }
+        if (enableXposedBridge) writeXposed(level, header, t)
+        if (enableLogcat) writeLogcat(level, header, t)
+        if (enableFile) enqueueFile(level, safeTag, msg, stack)
     }
 
-    /** 清空当前日志文件（异步）。 */
     fun clear() {
         ensureWriterStarted()
         queue.offer(CMD_CLEAR)
     }
 
-    /** 请求刷盘（异步，不阻塞）。 */
     fun flush() {
         ensureWriterStarted()
         queue.offer(CMD_FLUSH)
     }
 
-    /** 当前日志文件绝对路径；尚未解析成功时返回 null。 */
     fun currentLogPath(): String? =
         resolvedFile.get()?.absolutePath ?: resolveLogFile()?.absolutePath
 
-    /** 因队列满而丢弃的日志条数。 */
     fun droppedCount(): Long = dropCount.get()
-
-    // endregion
-
-    // region Sinks
 
     private fun writeXposed(level: Level, header: String, t: Throwable?) {
         try {
             XposedBridge.log("[$GLOBAL_TAG/${level.label}] $header")
-            if (t != null) {
-                XposedBridge.log(t)
-            }
+            if (t != null) XposedBridge.log(t)
         } catch (_: Throwable) {
-            // Xposed 环境不可用时忽略
         }
     }
 
@@ -209,7 +184,6 @@ object DebugLogger {
                 Level.ERROR -> Log.e(GLOBAL_TAG, header, t)
             }
         } catch (_: Throwable) {
-            // 宿主可能 hook/禁用 Log
         }
     }
 
@@ -229,10 +203,6 @@ object DebugLogger {
             dropCount.incrementAndGet()
         }
     }
-
-    // endregion
-
-    // region File writer
 
     private const val CMD_CLEAR = "__CLEAR__"
     private const val CMD_FLUSH = "__FLUSH__"
@@ -268,18 +238,14 @@ object DebugLogger {
 
                 when (item) {
                     CMD_CLEAR -> {
-                        try {
-                            writer?.flush()
-                            writer?.close()
-                        } catch (_: Throwable) {
-                        }
+                        closeQuietly(writer)
                         writer = null
                         val file = resolveLogFile()
                         currentFile = file
                         if (file != null) {
                             runCatching { file.writeText("") }
                             writer = openWriter(file, append = true)
-                            writeBanner(writer, file, state = "CLEARED")
+                            writeBanner(writer, file, "CLEARED")
                         }
                     }
 
@@ -292,60 +258,54 @@ object DebugLogger {
                     }
 
                     else -> {
-                        val file = resolveLogFile() ?: continue
+                        val file = resolveLogFile()
+                        if (file == null) continue
 
                         if (currentFile?.absolutePath != file.absolutePath || writer == null) {
-                            try {
-                                writer?.flush()
-                                writer?.close()
-                            } catch (_: Throwable) {
-                            }
+                            closeQuietly(writer)
                             currentFile = file
                             writer = openWriter(file, append = true)
-                            writeBanner(writer, file, state = "OPEN")
+                            writeBanner(writer, file, "OPEN")
                         }
 
                         if (file.exists() && file.length() > MAX_LOG_SIZE) {
-                            try {
-                                writer?.flush()
-                                writer?.close()
-                            } catch (_: Throwable) {
-                            }
+                            closeQuietly(writer)
                             rotate(file)
                             writer = openWriter(file, append = false)
-                            writeBanner(writer, file, state = "ROTATED")
+                            writeBanner(writer, file, "ROTATED")
                         }
 
                         try {
                             writer?.append(item)?.append('\n')
-                        } catch (_: Throwable) {
-                            try {
-                                writer?.close()
-                            } catch (_: Throwable) {
+                            if (forceFlushEachLine) {
+                                writer?.flush()
+                                lastFlushAt = System.currentTimeMillis()
+                            } else {
+                                val now = System.currentTimeMillis()
+                                if (now - lastFlushAt >= FLUSH_INTERVAL_MS) {
+                                    writer?.flush()
+                                    lastFlushAt = now
+                                }
                             }
+                        } catch (_: Throwable) {
+                            closeQuietly(writer)
                             writer = null
                             currentFile = null
                             resolvedFile.set(null)
-                            continue
-                        }
-
-                        val now = System.currentTimeMillis()
-                        if (now - lastFlushAt >= FLUSH_INTERVAL_MS) {
-                            try {
-                                writer?.flush()
-                                lastFlushAt = now
-                            } catch (_: Throwable) {
-                            }
                         }
                     }
                 }
             }
         } finally {
-            try {
-                writer?.flush()
-                writer?.close()
-            } catch (_: Throwable) {
-            }
+            closeQuietly(writer)
+        }
+    }
+
+    private fun closeQuietly(writer: BufferedWriter?) {
+        try {
+            writer?.flush()
+            writer?.close()
+        } catch (_: Throwable) {
         }
     }
 
@@ -381,23 +341,72 @@ object DebugLogger {
         }
     }
 
-    private fun resolveLogFile(): File? {
-        resolvedFile.get()?.let { return it }
+    private fun buildCandidates(): List<File> {
+        val pkg = packageNameRef.get() ?: "com.luna.music"
+        val list = mutableListOf<File>()
 
-        val candidates = buildList {
-            runCatching { File("/sdcard/$FILE_NAME") }.getOrNull()?.let { add(it) }
-            appExternalCacheDirRef.get()?.let { add(File(it, FILE_NAME)) }
-            appCacheDirRef.get()?.let { add(File(it, FILE_NAME)) }
+        // 1) 用户最容易看到的位置
+        runCatching {
+            File(
+                Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS),
+                FILE_NAME
+            )
+        }.getOrNull()?.let { list.add(it) }
+
+        runCatching { File("/sdcard/Download/$FILE_NAME") }.getOrNull()?.let { list.add(it) }
+        runCatching { File("/storage/emulated/0/Download/$FILE_NAME") }.getOrNull()?.let { list.add(it) }
+
+        // 2) App 外部目录（文件管理器可见 Android/data/...）
+        appExternalFilesDirRef.get()?.let { list.add(File(it, FILE_NAME)) }
+        appExternalCacheDirRef.get()?.let { list.add(File(it, FILE_NAME)) }
+        runCatching {
+            File("/sdcard/Android/data/$pkg/files/$FILE_NAME")
+        }.getOrNull()?.let { list.add(it) }
+        runCatching {
+            File("/sdcard/Android/data/$pkg/cache/$FILE_NAME")
+        }.getOrNull()?.let { list.add(it) }
+        runCatching {
+            File("/storage/emulated/0/Android/data/$pkg/files/$FILE_NAME")
+        }.getOrNull()?.let { list.add(it) }
+
+        // 3) 外部存储根（部分机型仍可写）
+        runCatching { File("/sdcard/$FILE_NAME") }.getOrNull()?.let { list.add(it) }
+
+        // 4) 内部目录兜底（需 root / adb 查看）
+        appFilesDirRef.get()?.let { list.add(File(it, FILE_NAME)) }
+        appCacheDirRef.get()?.let { list.add(File(it, FILE_NAME)) }
+
+        return list.distinctBy { it.absolutePath }
+    }
+
+    private fun resolveLogFile(): File? {
+        resolvedFile.get()?.let { existing ->
+            if (existing.exists() || runCatching {
+                    existing.parentFile?.mkdirs()
+                    existing.createNewFile()
+                }.isSuccess
+            ) {
+                return existing
+            }
+            resolvedFile.set(null)
         }
 
-        for (candidate in candidates) {
+        for (candidate in buildCandidates()) {
             try {
                 candidate.parentFile?.mkdirs()
                 if (!candidate.exists()) {
                     candidate.createNewFile()
                 }
-                FileOutputStream(candidate, true).use { /* probe writable */ }
+                // 探测可写
+                FileOutputStream(candidate, true).use { fos ->
+                    fos.write(byteArrayOf())
+                    fos.fd.sync()
+                }
                 if (resolvedFile.compareAndSet(null, candidate)) {
+                    try {
+                        XposedBridge.log("[$GLOBAL_TAG] file log -> ${candidate.absolutePath}")
+                    } catch (_: Throwable) {
+                    }
                     return candidate
                 }
                 return resolvedFile.get()
@@ -405,8 +414,13 @@ object DebugLogger {
                 // try next
             }
         }
+
+        if (resolveFailedOnce.compareAndSet(false, true)) {
+            try {
+                XposedBridge.log("[$GLOBAL_TAG] file log resolve FAILED, candidates tried=${buildCandidates().size}")
+            } catch (_: Throwable) {
+            }
+        }
         return null
     }
-
-    // endregion
 }
