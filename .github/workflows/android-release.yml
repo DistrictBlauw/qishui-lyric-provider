@@ -46,9 +46,21 @@ jobs:
           cache-disabled: false
 
       - name: Decode Keystore
-        if: ${{ github.event.inputs.build-type == 'release' || env.BUILD_TYPE == 'release' }}
+        # debug 构建也使用 release 签名配置（见 build.gradle.kts），因此始终需要 keystore
         run: |
-          echo "${{ secrets.SIGNING_KEY }}" | base64 -d > release.jks
+          if [ -n "${{ secrets.SIGNING_KEY }}" ]; then
+            echo "${{ secrets.SIGNING_KEY }}" | base64 -d > release.jks
+          else
+            # 无签名密钥时生成临时 debug keystore，使构建不中断
+            keytool -genkeypair -v \
+              -keystore release.jks \
+              -storepass android \
+              -alias androiddebugkey \
+              -keypass android \
+              -keyalg RSA -keysize 2048 \
+              -validity 10000 \
+              -dname "CN=Android Debug, OU=Debug, O=Debug, L=Debug, ST=Debug, C=US"
+          fi
 
       - name: Build APK
         run: |
@@ -59,9 +71,10 @@ jobs:
           fi
         env:
           RELEASE_STORE_FILE: ../release.jks
-          RELEASE_STORE_PASSWORD: ${{ secrets.KEY_STORE_PASSWORD }}
-          RELEASE_KEY_ALIAS: ${{ secrets.ALIAS }}
-          RELEASE_KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+          # 使用 secrets 中的签名信息；未配置时回退到临时 debug keystore 的默认值
+          RELEASE_STORE_PASSWORD: ${{ secrets.KEY_STORE_PASSWORD || 'android' }}
+          RELEASE_KEY_ALIAS: ${{ secrets.ALIAS || 'androiddebugkey' }}
+          RELEASE_KEY_PASSWORD: ${{ secrets.KEY_PASSWORD || 'android' }}
 
       - name: Collect APKs
         run: |
