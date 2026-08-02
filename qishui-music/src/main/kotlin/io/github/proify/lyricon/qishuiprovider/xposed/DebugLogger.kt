@@ -35,11 +35,27 @@ object DebugLogger {
     /**
      * 写入一条日志。
      *
+     * logcat 输出与文件写入分离：logcat 始终输出（不依赖文件解析结果），
+     * 文件写入作为可选附加功能，失败不影响 logcat。
+     *
      * @param tag 模块标签
      * @param msg 日志内容
      * @param t 可选异常
      */
     fun log(tag: String = "QiShui", msg: String, t: Throwable? = null) {
+        // 1. 始终输出到 logcat（不依赖文件解析，确保 adb logcat 可见）
+        try {
+            val logMsg = "[$tag] $msg"
+            if (t != null) {
+                android.util.Log.i("QishuiLyric", logMsg, t)
+            } else {
+                android.util.Log.i("QishuiLyric", logMsg)
+            }
+        } catch (_: Throwable) {
+            // logcat 不可用时不应崩溃
+        }
+
+        // 2. 尝试写入文件（可选，失败不影响 logcat）
         try {
             val file = resolveLogFile() ?: return
             val timestamp = dateFormat.format(Date())
@@ -47,12 +63,9 @@ object DebugLogger {
                 "\n${it.stackTraceToString()}"
             } ?: ""
             val line = "[$timestamp] [$tag] $msg$throwablePart\n"
-            // 同步追加写入（日志量不大，可接受）
             file.appendText(line)
-            // 同时输出到 logcat，便于 adb logcat 实时查看
-            android.util.Log.i("QishuiLyric", "[$tag] $msg", t)
         } catch (_: Throwable) {
-            // 日志本身不应导致崩溃
+            // 文件写入失败不应崩溃
         }
     }
 
