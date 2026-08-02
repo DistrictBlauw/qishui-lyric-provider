@@ -168,7 +168,7 @@ object QiShui : YukiBaseHooker() {
         // 缓存 JSON 中自带 track 元数据，优先用于补全 MediaMetadata 缺失的标题/艺人
         val metadata = MetadataCache.get(id)
         val song = cache.buildSong(id, metadata)
-        DebugLogger.log(TAG, "updateSong: buildSong done, song.name=${song.name}, song.artist=${song.artist}, song.duration=${song.duration}, song.lyrics.size=${song.lyrics.size}")
+        DebugLogger.log(TAG, "updateSong: buildSong done, song.name=${song.name}, song.artist=${song.artist}, song.duration=${song.duration}, song.lyrics.size=${song.lyrics?.size}")
         setSong(song)
     }
 
@@ -177,7 +177,7 @@ object QiShui : YukiBaseHooker() {
             DebugLogger.log(TAG, "setSong: song unchanged (same as lastSong), skipping setSong to provider")
             return
         }
-        DebugLogger.log(TAG, "setSong: setting song to provider, name=${song.name}, lyrics.size=${song.lyrics.size}")
+        DebugLogger.log(TAG, "setSong: setting song to provider, name=${song.name}, lyrics.size=${song.lyrics?.size}")
         provider?.player?.setSong(song)
         lastSong = song
     }
