@@ -4,7 +4,6 @@ import android.media.MediaMetadata
 import android.media.session.PlaybackState
 import com.highcapable.kavaref.KavaRef.Companion.resolve
 import com.highcapable.yukihookapi.hook.entity.YukiBaseHooker
-import com.highcapable.yukihookapi.hook.log.YLog
 import io.github.proify.lyricon.lyric.model.Song
 import io.github.proify.lyricon.provider.LyriconFactory
 import io.github.proify.lyricon.provider.LyriconProvider
@@ -21,16 +20,18 @@ object QiShui : YukiBaseHooker() {
     private var lastSong: Song? = null
 
     /**
-     * 内存中的歌词缓存：trackId -> NetResponseCache（含歌词内容）
+     * 内存歌词缓存：优先以 trackId 为键。
      *
-     * 通过 hook Track.setTrackLyric() 拦截到的歌词数据存储在此，
-     * 当 MediaSession 切歌时根据 mediaId 查找对应歌词。
+     * 注意：禁止在 trackId 与 curMediaId 未确认匹配时，把歌词盲写到 curMediaId。
+     * 冷启动预取其它曲目的 setTrackLyric 曾导致「第一首歌歌词不对」。
      */
     private val lyricCache = mutableMapOf<String, NetResponseCache>()
 
+    /** trackId → 最近一次写入时间，便于日志与调试。 */
+    private val lyricCachedAt = mutableMapOf<String, Long>()
+
     override fun onHook() {
-        YLog.info(tag = TAG, msg = "$packageName/$processName")
-        DebugLogger.log(TAG, "onHook() called, packageName=$packageName, processName=$processName")
+        DebugLogger.i(TAG, "onHook() packageName=$packageName, processName=$processName")
 
         onAppLifecycle {
             onCreate {
@@ -42,12 +43,11 @@ object QiShui : YukiBaseHooker() {
     private var hooked = false
     private fun hook() {
         if (hooked) {
-            YLog.info(tag = TAG, msg = "何意味")
-            DebugLogger.log(TAG, "hook() already called, skipping")
+            DebugLogger.w(TAG, "hook() already called, skipping")
             return
         }
         hooked = true
-        DebugLogger.log(TAG, "hook() first invocation, initializing")
+        DebugLogger.i(TAG, "hook() first invocation, initializing")
 
         initProvider()
         hookMediaSession()
@@ -56,12 +56,19 @@ object QiShui : YukiBaseHooker() {
 
     private fun initProvider() {
         val context = appContext ?: run {
-            DebugLogger.log(TAG, "initProvider() FAILED: appContext is null")
+            DebugLogger.e(TAG, "initProvider() FAILED: appContext is null")
             return
         }
-        DebugLogger.appCacheDir = context.cacheDir
-        DebugLogger.appExternalCacheDir = runCatching { context.externalCacheDir }.getOrNull()
-        DebugLogger.log(TAG, "initProvider() appContext=${context.packageName}, cacheDir=${context.cacheDir}, externalCacheDir=${context.externalCacheDir}")
+
+        DebugLogger.init(
+            cacheDir = context.cacheDir,
+            externalCacheDir = runCatching { context.externalCacheDir }.getOrNull()
+        )
+        DebugLogger.i(
+            TAG,
+            "initProvider() appContext=${context.packageName}, " +
+                "cacheDir=${context.cacheDir}, externalCacheDir=${context.externalCacheDir}"
+        )
 
         provider = LyriconFactory.createProvider(
             context = context,
@@ -73,8 +80,11 @@ object QiShui : YukiBaseHooker() {
             player.setDisplayTranslation(true)
             register()
         }
-        YLog.debug(tag = TAG, msg = "provider registered, provider=${provider?.providerInfo}")
-        DebugLogger.log(TAG, "initProvider() done, provider registered=${provider != null}, logPath=${DebugLogger.currentLogPath()}")
+        DebugLogger.i(
+            TAG,
+            "initProvider() done, registered=${provider != null}, " +
+                "providerInfo=${provider?.providerInfo}, logPath=${DebugLogger.currentLogPath()}"
+        )
     }
 
     private fun hookMediaSession() {
@@ -100,20 +110,40 @@ object QiShui : YukiBaseHooker() {
                         val mediaMetadata = args[0] as? MediaMetadata ?: return@after
                         val id = mediaMetadata.getString(MediaMetadata.METADATA_KEY_MEDIA_ID)
 
-                        DebugLogger.log(TAG, "setMetadata received, mediaId=$id, title=${mediaMetadata.getString(MediaMetadata.METADATA_KEY_TITLE)}, artist=${mediaMetadata.getString(MediaMetadata.METADATA_KEY_ARTIST)}, duration=${mediaMetadata.getLong(MediaMetadata.METADATA_KEY_DURATION)}")
+                        DebugLogger.d(
+                            TAG,
+                            "setMetadata mediaId=$id, " +
+                                "title=${mediaMetadata.getString(MediaMetadata.METADATA_KEY_TITLE)}, " +
+                                "artist=${mediaMetadata.getString(MediaMetadata.METADATA_KEY_ARTIST)}, " +
+                                "duration=${mediaMetadata.getLong(MediaMetadata.METADATA_KEY_DURATION)}"
+                        )
 
-                        if (curMediaId == id) {
-                            DebugLogger.log(TAG, "setMetadata: mediaId unchanged ($id), skipping")
+                        if (id.isNullOrBlank()) {
+                            DebugLogger.w(TAG, "setMetadata: blank mediaId, ignore")
                             return@after
                         }
 
+                        if (curMediaId == id) {
+                            // 同曲 metadata 刷新：补写 MetadataCache，并在仍无歌词时重试
+                            MetadataCache.save(mediaMetadata)
+                            DebugLogger.v(TAG, "setMetadata: mediaId unchanged ($id)")
+                            updateSongIfNeed()
+                            return@after
+                        }
+
+                        val previousId = curMediaId
                         curMediaId = id
                         MetadataCache.save(mediaMetadata)
-                        DebugLogger.log(TAG, "setMetadata: new mediaId=$id, calling updateSong()")
+                        DebugLogger.i(
+                            TAG,
+                            "setMetadata: mediaId $previousId -> $id, cacheKeys=${lyricCache.keys}, calling updateSong()"
+                        )
+                        // 切歌后必须按新 id 重新解析，避免沿用上一首错误歌词
                         updateSong()
                     }
                 }
             }
+        DebugLogger.d(TAG, "hookMediaSession() installed")
     }
 
     /**
@@ -123,10 +153,6 @@ object QiShui : YukiBaseHooker() {
      * - track_v2 API 响应使用 ServerPriorityStrategy，不写入磁盘缓存
      * - 歌词数据仅存在于内存的 Track.trackLyric 字段中
      * - Track.setTrackLyric(TrackLyric) 是设置歌词的唯一入口
-     * - TrackLyric 包含：lyric(LRC/KRC文本)、type(LRC/KRC/TEXT)、trackId、langTranslations
-     *
-     * 通过 hook 此方法，我们可以在歌词被设置到 Track 对象时拦截并提取歌词内容，
-     * 存入内存缓存供后续 MediaSession 切歌时使用。
      */
     private fun hookTrackLyric() {
         runCatching {
@@ -140,76 +166,168 @@ object QiShui : YukiBaseHooker() {
                 }.hook {
                     after {
                         val trackLyric = args.getOrNull(0) ?: return@after
-                        DebugLogger.log(TAG, "[setTrackLyric] intercepted, trackLyric class=${trackLyric.javaClass.name}")
+                        DebugLogger.d(
+                            TAG,
+                            "[setTrackLyric] intercepted, class=${trackLyric.javaClass.name}"
+                        )
 
                         val cache = extractLyricFromTrackLyric(trackLyric)
-                        if (cache != null) {
-                            val trackId = cache.lyric?.let { getTrackIdFromTrackLyric(trackLyric) }
-                                ?: cache.track?.name?.let { "unknown" }
-                            DebugLogger.log(TAG, "[setTrackLyric] extracted lyric: trackId=$trackId, type=${cache.lyric?.type}, content.length=${cache.lyric?.content?.length}, translations.keys=${cache.lyric?.lang_translations?.keys}")
-
-                            // 以 trackId 为 key 存入缓存
-                            val tid = getTrackIdFromTrackLyric(trackLyric)
-                            if (!tid.isNullOrBlank()) {
-                                lyricCache[tid] = cache
-                                DebugLogger.log(TAG, "[setTrackLyric] cached lyric for trackId=$tid, total cached=${lyricCache.size}")
-                            }
-                            // 同时尝试以当前 mediaId 为 key 存入（解决 trackId 与 mediaId 不一致的情况）
-                            curMediaId?.let { mid ->
-                                if (lyricCache[mid] == null) {
-                                    lyricCache[mid] = cache
-                                    DebugLogger.log(TAG, "[setTrackLyric] also cached for current mediaId=$mid")
-                                }
-                            }
-                            // 如果有新的歌词到达，尝试更新当前歌曲
-                            updateSongIfNeed()
-                        } else {
-                            DebugLogger.log(TAG, "[setTrackLyric] extractLyricFromTrackLyric returned null")
+                        if (cache == null) {
+                            DebugLogger.w(TAG, "[setTrackLyric] extractLyricFromTrackLyric returned null")
+                            return@after
                         }
+
+                        val trackId = getTrackIdFromTrackLyric(trackLyric)
+                        DebugLogger.i(
+                            TAG,
+                            "[setTrackLyric] trackId=$trackId, curMediaId=$curMediaId, " +
+                                "type=${cache.lyric?.type}, " +
+                                "content.length=${cache.lyric?.content?.length}, " +
+                                "translations=${cache.lyric?.lang_translations?.keys}"
+                        )
+
+                        onLyricArrived(trackId, cache)
                     }
                 }
-            DebugLogger.log(TAG, "hookTrackLyric() hooks installed successfully")
+            DebugLogger.i(TAG, "hookTrackLyric() installed successfully")
         }.onFailure {
-            DebugLogger.log(TAG, "hookTrackLyric() FAILED to install hooks", it)
+            DebugLogger.e(TAG, "hookTrackLyric() FAILED to install hooks", it)
         }
     }
 
     /**
-     * 从 TrackLyric Java 对象通过反射提取歌词数据，构建 NetResponseCache。
+     * 歌词到达后的统一处理：
+     * 1. 只按 trackId 写入权威缓存（可覆盖）
+     * 2. 仅当 trackId 与 curMediaId 匹配时建立 mediaId 别名
+     * 3. 匹配当前曲则强制 updateSong；否则仅在当前曲仍无歌词时尝试补推
      *
-     * TrackLyric 字段（通过 getter 访问）：
-     * - getLyric() -> String: 歌词文本（LRC/KRC格式）
-     * - getType() -> NetLyricType 枚举（LRC/KRC/TEXT），getValue() -> "lrc"/"krc"/"text"
-     * - getTrackId() -> String: trackId
-     * - getLangTranslations() -> Map<NetLyricsLanguage, TrackLyric>: 翻译歌词
-     * - getOriginalLyricLang() -> NetLyricsLanguage: 原始语言
+     * 修复：启动后第一首歌歌词不对
+     * - 旧逻辑：lyricCache[curMediaId]==null 时把任意预取歌词盲写到 curMediaId
+     * - 且 updateSongIfNeed 在已有（错误）歌词后不再刷新
+     */
+    private fun onLyricArrived(trackId: String?, cache: NetResponseCache) {
+        if (trackId.isNullOrBlank()) {
+            DebugLogger.w(TAG, "onLyricArrived: blank trackId, skip cache to avoid mis-bind")
+            // 没有 trackId 时绝不绑定到 curMediaId，避免张冠李戴
+            return
+        }
+
+        lyricCache[trackId] = cache
+        lyricCachedAt[trackId] = System.currentTimeMillis()
+        DebugLogger.d(
+            TAG,
+            "onLyricArrived: cached trackId=$trackId, total=${lyricCache.size}"
+        )
+
+        val mediaId = curMediaId
+        val matchesCurrent = !mediaId.isNullOrBlank() && idsMatch(mediaId, trackId)
+
+        if (matchesCurrent) {
+            // 建立 mediaId 别名，便于 updateSong 直接命中
+            if (mediaId != trackId) {
+                lyricCache[mediaId] = cache
+                lyricCachedAt[mediaId] = System.currentTimeMillis()
+                DebugLogger.d(
+                    TAG,
+                    "onLyricArrived: alias mediaId=$mediaId -> trackId=$trackId"
+                )
+            }
+            // 当前曲歌词到达：必须强制刷新（即使之前已错误推送过）
+            DebugLogger.i(TAG, "onLyricArrived: matches current, force updateSong()")
+            updateSong()
+            return
+        }
+
+        DebugLogger.d(
+            TAG,
+            "onLyricArrived: not current (trackId=$trackId, mediaId=$mediaId), try updateSongIfNeed"
+        )
+        updateSongIfNeed()
+    }
+
+    /**
+     * 判断 MediaSession mediaId 与 TrackLyric trackId 是否指向同一首歌。
+     * 兼容完全相等、互相包含、以及纯数字 id 后缀一致等常见差异。
+     */
+    private fun idsMatch(a: String?, b: String?): Boolean {
+        if (a.isNullOrBlank() || b.isNullOrBlank()) return false
+        if (a == b) return true
+
+        val na = normalizeId(a)
+        val nb = normalizeId(b)
+        if (na.isNotEmpty() && na == nb) return true
+
+        // 互为子串（避免过短误匹配）
+        if (na.length >= 8 && nb.length >= 8) {
+            if (na.contains(nb) || nb.contains(na)) return true
+        }
+
+        val da = digitsOf(a)
+        val db = digitsOf(b)
+        if (da.length >= 8 && da == db) return true
+
+        return false
+    }
+
+    private fun normalizeId(id: String): String =
+        id.trim().lowercase().removePrefix("track:").removePrefix("track_").removePrefix("id:")
+
+    private fun digitsOf(id: String): String = buildString(id.length) {
+        id.forEach { ch -> if (ch.isDigit()) append(ch) }
+    }
+
+    /**
+     * 按 mediaId 查找歌词：精确键 → 模糊匹配其它 trackId 键。
+     */
+    private fun findLyric(mediaId: String): NetResponseCache? {
+        lyricCache[mediaId]?.let {
+            DebugLogger.d(TAG, "findLyric: exact hit key=$mediaId")
+            return it
+        }
+        val matched = lyricCache.entries.firstOrNull { (key, _) -> idsMatch(key, mediaId) }
+        if (matched != null) {
+            DebugLogger.d(TAG, "findLyric: fuzzy hit mediaId=$mediaId -> key=${matched.key}")
+            // 回填别名，加速后续查找
+            lyricCache[mediaId] = matched.value
+            return matched.value
+        }
+        DebugLogger.d(TAG, "findLyric: miss mediaId=$mediaId, keys=${lyricCache.keys}")
+        return null
+    }
+
+    /**
+     * 从 TrackLyric Java 对象通过反射提取歌词数据，构建 NetResponseCache。
      */
     private fun extractLyricFromTrackLyric(trackLyricObj: Any): NetResponseCache? {
         return runCatching {
             val tlClass = trackLyricObj.javaClass
 
-            // 获取歌词文本
             val lyricContent = tlClass.getMethod("getLyric").invoke(trackLyricObj) as? String
             if (lyricContent.isNullOrBlank()) {
-                DebugLogger.log(TAG, "extractLyric: lyric content is null/blank")
+                DebugLogger.w(TAG, "extractLyric: lyric content is null/blank")
                 return@runCatching null
             }
 
-            // 获取歌词类型
             val typeObj = tlClass.getMethod("getType").invoke(trackLyricObj)
             val typeStr = typeObj?.let {
                 it.javaClass.getMethod("getValue").invoke(it) as? String
             }
-            DebugLogger.log(TAG, "extractLyric: type=$typeStr, content.length=${lyricContent.length}, preview=${lyricContent.take(80)?.replace("\n", "\\n")}")
+            DebugLogger.d(
+                TAG,
+                "extractLyric: type=$typeStr, length=${lyricContent.length}, " +
+                    "preview=${lyricContent.take(80).replace("\n", "\\n")}"
+            )
 
-            // 获取翻译
-            val langTranslations = tlClass.getMethod("getLangTranslations").invoke(trackLyricObj) as? Map<*, *>
+            val langTranslations =
+                tlClass.getMethod("getLangTranslations").invoke(trackLyricObj) as? Map<*, *>
             val translationsMap = mutableMapOf<String, NetResponseCache.Translation>()
             if (langTranslations != null) {
                 for ((key, value) in langTranslations) {
                     if (key == null || value == null) continue
-                    val langStr = key.javaClass.getMethod("getValue").invoke(key) as? String ?: continue
-                    val transLyric = value.javaClass.getMethod("getLyric").invoke(value) as? String
+                    val langStr =
+                        key.javaClass.getMethod("getValue").invoke(key) as? String ?: continue
+                    val transLyric =
+                        value.javaClass.getMethod("getLyric").invoke(value) as? String
                     val transType = value.javaClass.getMethod("getType").invoke(value)?.let { tObj ->
                         tObj.javaClass.getMethod("getValue").invoke(tObj) as? String
                     }
@@ -218,7 +336,10 @@ object QiShui : YukiBaseHooker() {
                             content = transLyric,
                             type = transType
                         )
-                        DebugLogger.log(TAG, "extractLyric: translation lang=$langStr, type=$transType, length=${transLyric.length}")
+                        DebugLogger.d(
+                            TAG,
+                            "extractLyric: translation lang=$langStr, type=$transType, length=${transLyric.length}"
+                        )
                     }
                 }
             }
@@ -232,60 +353,104 @@ object QiShui : YukiBaseHooker() {
                 track = null
             )
         }.onFailure {
-            DebugLogger.log(TAG, "extractLyricFromTrackLyric FAILED", it)
+            DebugLogger.e(TAG, "extractLyricFromTrackLyric FAILED", it)
             null
         }.getOrNull()
     }
 
-    /**
-     * 从 TrackLyric 对象获取 trackId
-     */
     private fun getTrackIdFromTrackLyric(trackLyricObj: Any): String? {
         return runCatching {
             trackLyricObj.javaClass.getMethod("getTrackId").invoke(trackLyricObj) as? String
+        }.onFailure {
+            DebugLogger.w(TAG, "getTrackIdFromTrackLyric failed", it)
         }.getOrNull()
     }
 
+    /**
+     * 当前曲尚无可用歌词、或 lastSong 已不是当前 mediaId 时，尝试补推。
+     */
     private fun updateSongIfNeed() {
-        if (curMediaId.isNullOrBlank()) return
-        val lastSong = this.lastSong
-        if (lastSong?.lyrics.isNullOrEmpty()) {
-            DebugLogger.log(TAG, "updateSongIfNeed: lyrics empty, re-triggering updateSong for mediaId=$curMediaId")
-            updateSong()
+        val id = curMediaId ?: return
+        val last = lastSong
+        val need =
+            last == null ||
+                last.id != id ||
+                last.lyrics.isNullOrEmpty()
+        if (!need) {
+            DebugLogger.v(TAG, "updateSongIfNeed: skip, lastSong ok for id=$id")
+            return
         }
+        // 仅当能查到歌词，或 last 完全缺失时才更新，避免用空数据覆盖
+        val hasLyric = findLyric(id) != null
+        if (!hasLyric && last != null && last.id == id) {
+            DebugLogger.v(TAG, "updateSongIfNeed: no lyric yet for id=$id")
+            return
+        }
+        DebugLogger.d(
+            TAG,
+            "updateSongIfNeed: refresh id=$id, lastId=${last?.id}, " +
+                "lastLyrics=${last?.lyrics?.size}, hasLyric=$hasLyric"
+        )
+        updateSong()
     }
 
     fun updateSong() {
         val id = curMediaId ?: run {
-            DebugLogger.log(TAG, "updateSong: curMediaId is null, aborting")
+            DebugLogger.w(TAG, "updateSong: curMediaId is null, aborting")
             return
         }
-        DebugLogger.log(TAG, "updateSong: START, mediaId=$id, lyricCache.size=${lyricCache.size}, cachedIds=${lyricCache.keys}")
+        DebugLogger.d(
+            TAG,
+            "updateSong: START mediaId=$id, cacheSize=${lyricCache.size}, keys=${lyricCache.keys}"
+        )
 
-        // 从内存缓存中查找歌词
-        val cache = lyricCache[id]
+        val cache = findLyric(id)
         if (cache == null) {
-            DebugLogger.log(TAG, "updateSong: no lyric in memory cache for mediaId=$id, falling back to MetadataCache only")
+            DebugLogger.w(TAG, "updateSong: no lyric for mediaId=$id, metadata only")
             val metadata = MetadataCache.get(id)
-            DebugLogger.log(TAG, "updateSong: MetadataCache.get($id) = title=${metadata?.title}, artist=${metadata?.artist}, duration=${metadata?.duration}")
-            setSong(Song(name = metadata?.title, artist = metadata?.artist))
+            DebugLogger.d(
+                TAG,
+                "updateSong: MetadataCache title=${metadata?.title}, " +
+                    "artist=${metadata?.artist}, duration=${metadata?.duration}"
+            )
+            setSong(
+                Song(
+                    id = id,
+                    name = metadata?.title,
+                    artist = metadata?.artist,
+                    duration = metadata?.duration?.takeIf { it != 0L && it != Long.MAX_VALUE } ?: 0L,
+                    lyrics = emptyList()
+                )
+            )
             return
         }
 
-        DebugLogger.log(TAG, "updateSong: lyric found in memory cache! lyric.type=${cache.lyric?.type}, lyric.content.length=${cache.lyric?.content?.length}, lyric.lang_translations.keys=${cache.lyric?.lang_translations?.keys}")
+        DebugLogger.i(
+            TAG,
+            "updateSong: lyric hit type=${cache.lyric?.type}, " +
+                "length=${cache.lyric?.content?.length}, " +
+                "translations=${cache.lyric?.lang_translations?.keys}"
+        )
 
         val metadata = MetadataCache.get(id)
         val song = cache.buildSong(id, metadata)
-        DebugLogger.log(TAG, "updateSong: buildSong done, song.name=${song.name}, song.artist=${song.artist}, song.duration=${song.duration}, song.lyrics.size=${song.lyrics?.size}")
+        DebugLogger.i(
+            TAG,
+            "updateSong: buildSong name=${song.name}, artist=${song.artist}, " +
+                "duration=${song.duration}, lyrics=${song.lyrics?.size}"
+        )
         setSong(song)
     }
 
     private fun setSong(song: Song) {
         if (song == lastSong) {
-            DebugLogger.log(TAG, "setSong: song unchanged (same as lastSong), skipping setSong to provider")
+            DebugLogger.v(TAG, "setSong: unchanged, skip")
             return
         }
-        DebugLogger.log(TAG, "setSong: setting song to provider, name=${song.name}, lyrics.size=${song.lyrics?.size}")
+        DebugLogger.i(
+            TAG,
+            "setSong: push id=${song.id}, name=${song.name}, lyrics=${song.lyrics?.size}"
+        )
         provider?.player?.setSong(song)
         lastSong = song
     }
@@ -294,9 +459,12 @@ object QiShui : YukiBaseHooker() {
         val trackName = metadata?.title?.takeIf { it.isNotBlank() }.orEmpty()
         val trackArtist = metadata?.artist?.takeIf { it.isNotBlank() }.orEmpty()
         val trackDuration = metadata?.duration?.takeIf { it != 0L && it != Long.MAX_VALUE } ?: 0L
-        DebugLogger.log(TAG, "buildSong: id=$id, trackName=$trackName (fromMeta=${metadata?.title}), trackArtist=$trackArtist (fromMeta=${metadata?.artist}), trackDuration=$trackDuration")
+        DebugLogger.d(
+            TAG,
+            "buildSong: id=$id, name=$trackName, artist=$trackArtist, duration=$trackDuration"
+        )
         val lyrics = toRichLyric()
-        DebugLogger.log(TAG, "buildSong: toRichLyric() returned ${lyrics.size} lines")
+        DebugLogger.d(TAG, "buildSong: toRichLyric() -> ${lyrics.size} lines")
         return Song(
             id = id,
             name = trackName,

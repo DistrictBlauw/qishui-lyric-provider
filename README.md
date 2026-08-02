@@ -25,25 +25,33 @@
 
 本项目是 [LyricProvider](https://github.com/tomakino/LyricProvider) 的汽水音乐模块独立版本。
 
-通过 Hook 汽水音乐（字节跳动 Luna 音乐，包名 `com.luna.music`）的 `MediaSession`，读取其本地网络缓存中的歌词数据，并向已适配 **Lyricon** 标准的歌词订阅端（如光锥音乐、BBPlayer 等）提供：
+通过 Hook 汽水音乐（字节跳动 Luna 音乐，包名 `com.luna.music`）内部的歌词赋值与 `MediaSession`，向已适配 **Lyricon** 标准的歌词订阅端（如光锥音乐、BBPlayer 等）提供：
 
 - 🎵 **动态歌词**（KRC 逐字 / LRC 逐行）
 - 🌐 **翻译歌词**（自动匹配系统语言）
 - ℹ️ **歌曲元数据**（标题、艺人、时长）
+- ▶️ **播放状态**（与 MediaSession 同步）
 
 ### 工作原理
 
-汽水音乐在播放歌曲时会通过 [`NetCacheLoader`](qishui-music/src/main/kotlin/io/github/proify/lyricon/qishuiprovider/xposed/QiShui.kt) 将完整的 `GetTrackResponse` JSON 缓存到本地磁盘。本模块通过逆向分析定位缓存文件，直接读取并解析其中的歌词与元数据，无需额外网络请求。
+汽水音乐在拿到曲目详情后，会将歌词写入内存对象 `Track.trackLyric`（`track_v2` 响应常使用 `ServerPriorityStrategy`，**不一定落盘**）。本模块：
 
-**缓存路径**（基于逆向 [`NetCacheLoader.getCacheFilePath()`](qishui-music/src/main/kotlin/io/github/proify/lyricon/qishuiprovider/xposed/QiShui.kt:154)）：
+1. Hook `Track.setTrackLyric(TrackLyric)`，在内存中拦截官方歌词与翻译
+2. Hook `MediaSession.setMetadata` / `setPlaybackState`，获取当前曲目 ID、元数据与播放状态
+3. 仅在 `trackId` 与当前 `mediaId` **匹配**时绑定并推送，避免冷启动预取串词
+4. 将 KRC/LRC 解析为 Lyricon `RichLyricLine`，经 Lyricon Provider 推送给订阅端
+
+**无需额外网络请求**，歌词来自汽水官方数据路径。
 
 ```
-{cacheDir 或 externalCacheDir}/NetCacheLoader/{userId}/{md5("/luna/track_v2/" + trackId)}
+MediaSession (mediaId / 元数据 / 播放状态)
+        +
+Track.setTrackLyric (KRC|LRC + 翻译)
+        ↓
+  内存 lyricCache（按 trackId，匹配后才别名 mediaId）
+        ↓
+  toRichLyric() → Song → Lyricon 订阅端
 ```
-
-- 缓存有效期：**7 天**（604800000 ms）
-- 文件名：HTTP 请求路径 + trackId 的 32 位小写 MD5
-- 根目录受 `ExternalCacheDirConfig` 远程配置控制，模块同时检查两个候选目录
 
 ---
 
@@ -79,16 +87,17 @@
 qishui-lyric-provider/
 ├── qishui-music/              # 汽水音乐主模块（Xposed Application）
 │   └── src/main/kotlin/.../xposed/
-│       ├── QiShui.kt          # 核心 Hook 逻辑
-│       ├── HookEntry.kt       # Xposed 入口
+│       ├── QiShui.kt          # 核心 Hook：MediaSession + setTrackLyric + 推送
+│       ├── HookEntry.kt       # Xposed / YukiHookAPI 入口
 │       ├── MetadataCache.kt   # MediaSession 元数据缓存
-│       ├── Constants.kt       # 常量定义（包名、图标）
+│       ├── DebugLogger.kt     # 分级异步日志（LSPosed / logcat / 文件）
+│       ├── Constants.kt       # 包名、图标等常量
 │       └── parser/
-│           ├── NetResponseCache.kt  # 缓存 JSON 结构映射
-│           ├── Helper.kt            # 歌词解析辅助
-│           └── KtvLyricParser.kt    # KRC 逐字歌词解析器
+│           ├── NetResponseCache.kt  # 歌词数据结构（兼容旧 JSON 样例）
+│           ├── Helper.kt            # KRC/LRC 解析与翻译对齐
+│           └── KtvLyricParser.kt    # KRC 逐字解析器
 ├── share/
-│   ├── extensions-kt/         # Kotlin 通用扩展（MD5、JSON 等）
+│   ├── extensions-kt/         # Kotlin 通用扩展
 │   ├── extensions-android/    # Android 平台扩展
 │   └── lrckit/                # LRC 歌词解析库
 ├── build.gradle.kts           # 根构建脚本
@@ -104,7 +113,7 @@ qishui-lyric-provider/
 
 - **JDK** 21+
 - **Android SDK**（compileSdk 37, targetSdk 37, minSdk 27）
-- **Gradle** 9.3.1+（项目自带 wrapper）
+- **Gradle**（项目自带 wrapper）
 
 ### 构建命令
 
@@ -142,24 +151,66 @@ export RELEASE_KEY_PASSWORD=your_key_password
 
 ## 📜 技术细节
 
+### 数据来源（当前实现）
+
+| Hook / 组件 | 作用 |
+|:---|:---|
+| `Track.setTrackLyric(TrackLyric)` | 拦截内存歌词：原文、类型（krc/lrc）、trackId、多语言翻译 |
+| `MediaSession.setMetadata` | 当前 `mediaId`、标题、艺人、时长 |
+| `MediaSession.setPlaybackState` | 播放状态同步；歌词晚到时触发补推 |
+| `LyriconFactory.createProvider` | 向 Lyricon 订阅端注册并推送 `Song` |
+
+### 歌词绑定策略（防串词）
+
+冷启动时汽水可能**预取多首**歌词。模块约定：
+
+1. **只按 `trackId` 写入权威缓存**；无 `trackId` 的数据直接丢弃
+2. **仅当 `trackId` 与当前 `mediaId` 匹配**时，才建立 `mediaId` 别名并推送
+3. 匹配当前曲时 **强制 `updateSong()`**，覆盖此前空歌词或错误歌词
+4. `findLyric(mediaId)` 支持精确键与模糊匹配（归一化、子串、长数字 id）
+
+> 这修复了「启动后第一首歌歌词不对」：旧逻辑曾把任意预取歌词盲写到 `curMediaId`，且错误歌词推送后不再刷新。
+
+### 解析能力
+
+| 类型 | 解析器 | 说明 |
+|:---|:---|:---|
+| `krc` | `KtvLyricParser` | 逐字：`[start,duration]` + `<offset,duration,?>字` |
+| `lrc` | `share/lrckit` `LrcParser` | 逐行；翻译常用 LRC |
+| 翻译 | `Helper.getLangKeyForTranslations` | 按系统 Locale 匹配（含中文 Hans/Hant 回退），`findClosest(±50ms)` 对齐 |
+
+### 调试日志
+
+[`DebugLogger`](qishui-music/src/main/kotlin/io/github/proify/lyricon/qishuiprovider/xposed/DebugLogger.kt) 提供分级日志：
+
+- 级别：`V / D / I / W / E`（默认最低 `DEBUG`）
+- 通道：LSPosed（`XposedBridge`）+ logcat（tag `QishuiLyric`）+ 可选文件
+- 文件异步写入，超过 2MB 轮转备份；候选路径：
+  1. `/sdcard/qishui-lyric-debug.log`
+  2. `{externalCacheDir}/qishui-lyric-debug.log`
+  3. `{cacheDir}/qishui-lyric-debug.log`
+
+排查首曲/串词时可在日志中搜索：`onLyricArrived`、`matches current`、`findLyric`、`setMetadata`。
+
 ### 逆向分析依据
 
-本模块的缓存读取逻辑基于对汽水音乐 APK（`com.luna.music`）的逆向分析：
-
-| 逆向类 | 作用 |
+| 逆向类 / 符号 | 作用 |
 |:---|:---|
-| `NetCacheLoader.getCacheFilePath()` | 缓存路径生成核心逻辑 |
-| `IdCacheKeyProvider` | 缓存 key = HTTP路径 + "/" + trackId |
-| `TrackApi` | `@POST("/luna/track_v2")` 定义请求路径 |
-| `MD5Util.c()` | 32 位小写 MD5 哈希 |
-| `ExternalCacheDirConfig` | 外部缓存目录开关（远程可配置） |
-| `TrackRepo.y0()` | 网络请求与缓存策略（7天有效期） |
+| `com.luna.common.arch.db.entity.Track` | `setTrackLyric` 歌词入口 |
+| `com.luna.common.arch.db.entity.TrackLyric` | lyric / type / trackId / langTranslations |
+| `TrackApi` `@POST("/luna/track_v2")` | 曲目详情与歌词来源 API |
+| `ServerPriorityStrategy` | 响应优先内存，不一定写 `NetCacheLoader` 磁盘缓存 |
 
-### 关键优化
+> 历史方案曾读取 `{cacheDir}/NetCacheLoader/{userId}/{md5("/luna/track_v2/"+trackId)}`。当前以内存 Hook 为准；`NetResponseCache` 仍兼容旧 JSON 结构（单测资源 `1.json` / `2.json`）。
 
-1. **双目录搜索**：同时检查 `cacheDir` 和 `externalCacheDir`，应对 `ExternalCacheDirConfig` 远程开关
-2. **元数据回退**：优先使用 MediaSession 提供的标题/艺人，缺失时从缓存 JSON 的 `track` 字段补全
-3. **向后兼容**：`NetResponseCache` 新增字段均有默认值，旧版缓存 JSON 仍可正常解析
+---
+
+## 🐛 已知问题与修复
+
+| 问题 | 状态 | 说明 |
+|:---|:---|:---|
+| 启动后第一首歌歌词不对 | **已修复** | 禁止预取歌词盲写 `curMediaId`；匹配当前曲强制刷新 |
+| 汽水改版导致 Hook 失效 | 依赖维护 | 类名/方法名变更时需更新 Hook 点 |
 
 ---
 
