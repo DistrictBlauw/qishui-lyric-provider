@@ -5,17 +5,27 @@ import io.github.proify.lrckit.LrcParser
 import io.github.proify.lyricon.lyric.model.LyricLine
 import io.github.proify.lyricon.lyric.model.RichLyricLine
 import io.github.proify.lyricon.lyric.model.extensions.normalize
+import io.github.proify.lyricon.qishuiprovider.xposed.DebugLogger
 import java.util.Locale
 
 fun NetResponseCache.toRichLyric(): List<RichLyricLine> {
+    DebugLogger.log("Helper", "toRichLyric: START, lyric.type=${lyric?.type}, lyric.content.length=${lyric?.content?.length}, lyric.content.preview=${lyric?.content?.take(100)?.replace("\n", "\\n")}, lang_translations.keys=${lyric?.lang_translations?.keys}")
+
     val lines = parserTypeLyric(lyric?.type, lyric?.content)?.normalize()
-    if (lines.isNullOrEmpty()) return emptyList()
+    DebugLogger.log("Helper", "toRichLyric: parserTypeLyric returned ${lines?.size ?: "null"} lines (after normalize)")
+    if (lines.isNullOrEmpty()) {
+        DebugLogger.log("Helper", "toRichLyric: lines is null/empty, returning emptyList. lyric.type=${lyric?.type} (supported: krc, lrc)")
+        return emptyList()
+    }
 
     val langKey = lyric?.lang_translations?.keys?.let { getLangKeyForTranslations(it) }
     val translation = lyric?.lang_translations?.get(langKey.orEmpty())
-    val translationLines = parserTypeLyric(translation?.type, translation?.content)?.normalize()
+    DebugLogger.log("Helper", "toRichLyric: selected langKey=$langKey, translation.type=${translation?.type}, translation.content.length=${translation?.content?.length}")
 
-    return lines.map { line ->
+    val translationLines = parserTypeLyric(translation?.type, translation?.content)?.normalize()
+    DebugLogger.log("Helper", "toRichLyric: translationLines=${translationLines?.size ?: "null"} lines")
+
+    val result = lines.map { line ->
         val translation = translationLines?.findClosest(line.begin, 50)?.text
 
         RichLyricLine(
@@ -27,15 +37,35 @@ fun NetResponseCache.toRichLyric(): List<RichLyricLine> {
             translation = if (translation == line.text) null else translation
         )
     }
+    DebugLogger.log("Helper", "toRichLyric: DONE, returning ${result.size} RichLyricLine(s)")
+    return result
 }
 
 private fun parserTypeLyric(type: String?, lyric: String?): List<LyricLine>? {
-    if (type.isNullOrBlank() || lyric.isNullOrBlank()) return null
-    return when (type.lowercase()) {
-        "krc" -> KtvLyricParser.parse(lyric)
-        "lrc" -> LrcParser.parse(lyric).lines
-        else -> null
+    if (type.isNullOrBlank() || lyric.isNullOrBlank()) {
+        DebugLogger.log("Helper", "parserTypeLyric: type or lyric is blank, type=$type, lyric.length=${lyric?.length}")
+        return null
     }
+    return runCatching {
+        when (type.lowercase()) {
+            "krc" -> {
+                val result = KtvLyricParser.parse(lyric)
+                DebugLogger.log("Helper", "parserTypeLyric: KRC parsed ${result.size} lines")
+                result
+            }
+            "lrc" -> {
+                val result = LrcParser.parse(lyric).lines
+                DebugLogger.log("Helper", "parserTypeLyric: LRC parsed ${result.size} lines")
+                result
+            }
+            else -> {
+                DebugLogger.log("Helper", "parserTypeLyric: UNKNOWN lyric type '$type', returning null")
+                null
+            }
+        }
+    }.onFailure {
+        DebugLogger.log("Helper", "parserTypeLyric: parse FAILED for type=$type", it)
+    }.getOrNull()
 }
 
 /**
