@@ -1,5 +1,6 @@
 package io.github.proify.lyricon.qishuiprovider.xposed
 
+import de.robv.android.xposed.XposedBridge
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -43,19 +44,29 @@ object DebugLogger {
      * @param t 可选异常
      */
     fun log(tag: String = "QiShui", msg: String, t: Throwable? = null) {
-        // 1. 始终输出到 logcat（不依赖文件解析，确保 adb logcat 可见）
+        val logMsg = "[$tag] $msg"
+
+        // 1. 通过 XposedBridge.log 输出到 LSPosed 日志（adb logcat -s LSPosed 可见）
+        //    ByteDance 应用可能重写 android.util.Log，导致标准 logcat 不可见，
+        //    XposedBridge.log 走 LSPosed 自己的日志通道，不受应用干扰。
         try {
-            val logMsg = "[$tag] $msg"
             if (t != null) {
-                android.util.Log.i("QishuiLyric", logMsg, t)
+                XposedBridge.log("[QishuiLyric] $logMsg")
+                XposedBridge.log(t)
             } else {
-                android.util.Log.i("QishuiLyric", logMsg)
+                XposedBridge.log("[QishuiLyric] $logMsg")
             }
         } catch (_: Throwable) {
-            // logcat 不可用时不应崩溃
+            // XposedBridge 不可用时不应崩溃
         }
 
-        // 2. 尝试写入文件（可选，失败不影响 logcat）
+        // 2. 同时输出到标准 logcat（双通道，有些环境仍可用）
+        try {
+            android.util.Log.i("QishuiLyric", logMsg, t)
+        } catch (_: Throwable) {
+        }
+
+        // 3. 尝试写入文件（可选，失败不影响 logcat）
         try {
             val file = resolveLogFile() ?: return
             val timestamp = dateFormat.format(Date())
