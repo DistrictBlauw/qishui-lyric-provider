@@ -1,48 +1,64 @@
 <!--suppress ALL -->
 
-# LyricProvider - 歌词提供器
+# Qishui Lyric Provider - 汽水音乐歌词提供器
 
-#### 基于Xposed 的歌词提供器
+#### 基于 Xposed 的汽水音乐（Luna）歌词提供器
 
 ![Platform](https://img.shields.io/badge/Platform-Android-brightgreen?style=flat&logo=android)
-![Release](https://img.shields.io/github/v/release/tomakino/LyricProvider?style=flat&color=blue&logo=github)
-![Size](https://img.shields.io/github/repo-size/tomakino/LyricProvider)
-![Downloads](https://img.shields.io/github/downloads/tomakino/LyricProvider/total?style=flat&color=orange)
-![License](https://img.shields.io/github/license/tomakino/LyricProvider?style=flat)
-![Last Commit](https://img.shields.io/github/last-commit/tomakino/LyricProvider?style=flat)
+![Min SDK](https://img.shields.io/badge/Min%20SDK-27-orange?style=flat&logo=android)
+![License](https://img.shields.io/github/license/DistrictBlauw/qishui-lyric-provider?style=flat)
+![Last Commit](https://img.shields.io/github/last-commit/DistrictBlauw/qishui-lyric-provider?style=flat)
+![Build](https://img.shields.io/github/actions/workflow/status/DistrictBlauw/qishui-lyric-provider/android-release.yml?style=flat&logo=github)
 
 <p align="left">
-  <a href="README-English.md"><img src="https://img.shields.io/badge/Document-English-red.svg" alt="EN"></a>
+  <a href="https://github.com/DistrictBlauw/qishui-lyric-provider/releases">
+    <img src="https://img.shields.io/github/v/release/DistrictBlauw/qishui-lyric-provider?style=flat&color=blue&logo=github" alt="Release">
+  </a>
+  <a href="https://github.com/DistrictBlauw/qishui-lyric-provider/releases">
+    <img src="https://img.shields.io/github/downloads/DistrictBlauw/qishui-lyric-provider/total?style=flat&color=orange" alt="Downloads">
+  </a>
 </p>
 
-## 🎵 支持平台
+---
 
-### 核心适配列表
+## 📖 项目简介
 
-| 平台名称               | 标识符                 | 功能说明                 |
-|:-------------------|:--------------------|:---------------------|
-| 🍎 **Apple Music** | `apple-music`       | 支持逐字、翻译、背景人声、对唱格式歌词  |
-| ☁️ **网易云音乐/荣耀版**   | `163-music`         | 支持逐字歌词、翻译歌词          |
-| 🐧 **QQ 音乐**       | `qq-music`          | 支持逐字歌词、翻译歌词          |
-| 🐧 **QQ 音乐 HD**    | `qq-music-hd`       | 支持逐字歌词、翻译歌词          |
-| 🧊 **LX 音乐**       | `lx-music`          | 支持翻译歌词显示             |
-| 🐶 **酷狗音乐/概念版**    | `kugou-music`       | **需在 App 内开启车载歌词模式** |
-| 📻 **酷我音乐**        | `kuwo-music`        | **需在 App 内开启车载歌词模式** |
-| 🎧 **Spotify**     | `spotify-music`     | 目前仅支持标准歌词            |
-| ⚡ **Poweramp**     | `poweramp-music`    | 支持网络匹配及本地内嵌歌词        |
-| 🧂 **Salt 音乐**     | `salt-player-music` | 基于魅族标准歌词接口适配         |
-| 🎵 **汽水音乐**        | `qishui-music`      | 支持动态歌词、翻译歌词          |
-| 🎵 **MusicFree**   | `music-free`        | 支持翻译                 |
+本项目是 [LyricProvider](https://github.com/tomakino/LyricProvider) 的汽水音乐模块独立版本。
 
-### 通用/特殊模块
+通过 Hook 汽水音乐（字节跳动 Luna 音乐，包名 `com.luna.music`）的 `MediaSession`，读取其本地网络缓存中的歌词数据，并向已适配 **Lyricon** 标准的歌词订阅端（如光锥音乐、BBPlayer 等）提供：
 
-| 模块名称          | 标识符 (ID)         | 适用场景              |
-|:--------------|:-----------------|:------------------|
-| ☁️ **云音乐提供者** | `cloud-provider` | 通用型，通过搜索匹配在线歌词库   |
-| 📱 **魅族歌词支持** | `meizu-provider` | 适用于已适配魅族状态栏歌词的播放器 |
-| 🧂 **车载歌词支持** | `car-provider`   | 适用于已适配车载歌词适配的播放器  |
+- 🎵 **动态歌词**（KRC 逐字 / LRC 逐行）
+- 🌐 **翻译歌词**（自动匹配系统语言）
+- ℹ️ **歌曲元数据**（标题、艺人、时长）
 
-### 💡 已原生适配的应用
+### 工作原理
+
+汽水音乐在播放歌曲时会通过 [`NetCacheLoader`](qishui-music/src/main/kotlin/io/github/proify/lyricon/qishuiprovider/xposed/QiShui.kt) 将完整的 `GetTrackResponse` JSON 缓存到本地磁盘。本模块通过逆向分析定位缓存文件，直接读取并解析其中的歌词与元数据，无需额外网络请求。
+
+**缓存路径**（基于逆向 [`NetCacheLoader.getCacheFilePath()`](qishui-music/src/main/kotlin/io/github/proify/lyricon/qishuiprovider/xposed/QiShui.kt:154)）：
+
+```
+{cacheDir 或 externalCacheDir}/NetCacheLoader/{userId}/{md5("/luna/track_v2/" + trackId)}
+```
+
+- 缓存有效期：**7 天**（604800000 ms）
+- 文件名：HTTP 请求路径 + trackId 的 32 位小写 MD5
+- 根目录受 `ExternalCacheDirConfig` 远程配置控制，模块同时检查两个候选目录
+
+---
+
+## 📥 快速安装
+
+1. **下载**：前往 [Releases 页面](https://github.com/DistrictBlauw/qishui-lyric-provider/releases) 获取最新的 APK 安装包。
+2. **激活**：安装后进入 **LSPosed 管理器**，勾选启用 **汽水音乐歌词提供器**。
+3. **配置作用域**：在 LSPosed 中勾选 **汽水音乐**（`com.luna.music`）。
+4. **生效**：强行停止并重新打开汽水音乐即可体验。
+
+---
+
+## 🎯 已适配的订阅端
+
+以下应用已适配 Lyricon 歌词订阅标准，可直接接收本模块提供的歌词：
 
 - [**光锥音乐**](https://coneplayer.trantor.ink/)
 - **Flamingo**
@@ -53,44 +69,111 @@
 - [**QZ Music**](https://github.com/lqtmcstudio/QZMusic)
 - [**棉花音乐**](https://github.com/pure-music/PureMusic)
 
-#### 已适配了但没有你的播放器？请[提交 issue](https://github.com/tomakino/LyricProvider/issues)。
+> 完整订阅端开发文档请参考 [Lyricon 开发文档](https://tomakino.github.io/lyricon/zh-cn/developer/subscriber/)
 
 ---
 
-## 📥 快速安装
+## 🏗️ 项目结构
 
-1. **下载**：前往 [Releases 页面](https://github.com/tomakino/LyricProvider/releases) 获取最新的 APK
-   安装包。
-2. **激活**：安装后进入 **LSPosed 管理器**，勾选启用 **对应提供者**。
-3. **配置作用域**：在 LSPosed 中勾选你需要获取歌词的音乐 App（如 Apple Music、网易云等）。
-4. **生效**：强行停止并重新打开对应的音乐 App 即可体验。
+```
+qishui-lyric-provider/
+├── qishui-music/              # 汽水音乐主模块（Xposed Application）
+│   └── src/main/kotlin/.../xposed/
+│       ├── QiShui.kt          # 核心 Hook 逻辑
+│       ├── HookEntry.kt       # Xposed 入口
+│       ├── MetadataCache.kt   # MediaSession 元数据缓存
+│       ├── Constants.kt       # 常量定义（包名、图标）
+│       └── parser/
+│           ├── NetResponseCache.kt  # 缓存 JSON 结构映射
+│           ├── Helper.kt            # 歌词解析辅助
+│           └── KtvLyricParser.kt    # KRC 逐字歌词解析器
+├── share/
+│   ├── extensions-kt/         # Kotlin 通用扩展（MD5、JSON 等）
+│   ├── extensions-android/    # Android 平台扩展
+│   └── lrckit/                # LRC 歌词解析库
+├── build.gradle.kts           # 根构建脚本
+├── settings.gradle.kts        # 模块配置
+└── .github/workflows/         # CI/CD 构建脚本
+```
 
 ---
 
-## 🛠️ 开发者指南
+## 🛠️ 本地构建
 
-我们非常欢迎社区提交 Pull Request 来适配更多音乐 App。
+### 环境要求
 
-请阅读 [开发文档](https://tomakino.github.io/lyricon/zh-cn/developer/provider/)
+- **JDK** 21+
+- **Android SDK**（compileSdk 37, targetSdk 37, minSdk 27）
+- **Gradle** 9.3.1+（项目自带 wrapper）
 
-或者 [订阅歌词](https://tomakino.github.io/lyricon/zh-cn/developer/subscriber/)
+### 构建命令
+
+```bash
+# Debug 构建
+./gradlew assembleDebug
+
+# Release 构建（需配置签名）
+./gradlew assembleRelease
+```
+
+### 签名配置
+
+Release 构建需要通过环境变量提供签名信息：
+
+```bash
+export RELEASE_STORE_FILE=/path/to/release.jks
+export RELEASE_STORE_PASSWORD=your_store_password
+export RELEASE_KEY_ALIAS=your_key_alias
+export RELEASE_KEY_PASSWORD=your_key_password
+```
 
 ---
 
-## 👥 贡献者
+## 📦 CI/CD
 
-[![Contributors](https://contrib.rocks/image?repo=tomakino/LyricProvider)](https://github.com/tomakino/LyricProvider/graphs/contributors)
+本项目使用 GitHub Actions 进行自动化构建，配置位于 [`.github/workflows/android-release.yml`](.github/workflows/android-release.yml)。
 
-### ⭐ Star 增长
+- **手动触发**：在 Actions 页面选择 build type（debug/release）手动运行
+- **Tag 触发**：推送 `v*` 格式的 tag 时自动构建 release APK 并发布到 Releases
 
-<a href="https://star-history.com/#tomakino/LyricProvider&Date">
- <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=tomakino/LyricProvider&type=Date&theme=dark" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=tomakino/LyricProvider&type=Date" />
-   <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=tomakino/LyricProvider&type=Date" />
- </picture>
-</a>
+构建产物会上传为 Artifact，tag 触发时同时创建 GitHub Release。
 
-### 👀 访问趋势
+---
 
-![Visitors](https://count.getloli.com/get/@tomakino_LyricProvider?theme=minecraft)
+## 📜 技术细节
+
+### 逆向分析依据
+
+本模块的缓存读取逻辑基于对汽水音乐 APK（`com.luna.music`）的逆向分析：
+
+| 逆向类 | 作用 |
+|:---|:---|
+| `NetCacheLoader.getCacheFilePath()` | 缓存路径生成核心逻辑 |
+| `IdCacheKeyProvider` | 缓存 key = HTTP路径 + "/" + trackId |
+| `TrackApi` | `@POST("/luna/track_v2")` 定义请求路径 |
+| `MD5Util.c()` | 32 位小写 MD5 哈希 |
+| `ExternalCacheDirConfig` | 外部缓存目录开关（远程可配置） |
+| `TrackRepo.y0()` | 网络请求与缓存策略（7天有效期） |
+
+### 关键优化
+
+1. **双目录搜索**：同时检查 `cacheDir` 和 `externalCacheDir`，应对 `ExternalCacheDirConfig` 远程开关
+2. **元数据回退**：优先使用 MediaSession 提供的标题/艺人，缺失时从缓存 JSON 的 `track` 字段补全
+3. **向后兼容**：`NetResponseCache` 新增字段均有默认值，旧版缓存 JSON 仍可正常解析
+
+---
+
+## 📄 开源协议
+
+本项目基于 [Apache License 2.0](LICENSE) 开源。
+
+原始项目：[tomakino/LyricProvider](https://github.com/tomakino/LyricProvider)
+
+---
+
+## 🙏 鸣谢
+
+- [tomakino](https://github.com/tomakino) - 原始 LyricProvider 项目
+- [YukiHookAPI](https://github.com/HighCapable/YukiHookAPI) - Xposed Hook 框架
+- [kavaref](https://github.com/HighCapable/kavaref) - Kotlin 反射增强库
+- [Lyricon](https://github.com/tomakino/lyricon) - 歌词提供标准

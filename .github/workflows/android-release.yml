@@ -1,4 +1,4 @@
-name: Android Multi-App Build & Release
+name: Android Build & Release
 
 on:
   workflow_dispatch:
@@ -11,10 +11,13 @@ on:
           - release
         default: debug
         required: true
+  push:
+    tags:
+      - 'v*'
 
 jobs:
   build-and-release:
-    name: Build and Release Apps
+    name: Build and Release
     runs-on: ubuntu-latest
 
     env:
@@ -47,12 +50,12 @@ jobs:
         run: |
           echo "${{ secrets.SIGNING_KEY }}" | base64 -d > release.jks
 
-      - name: Build APKs with Caching
+      - name: Build APK
         run: |
           if [ "$BUILD_TYPE" = "release" ]; then
-            ./gradlew assembleRelease --build-cache
+            ./gradlew :qishui-music:assembleRelease --build-cache
           else
-            ./gradlew assembleDebug --build-cache
+            ./gradlew :qishui-music:assembleDebug --build-cache
           fi
         env:
           RELEASE_STORE_FILE: ../release.jks
@@ -60,7 +63,7 @@ jobs:
           RELEASE_KEY_ALIAS: ${{ secrets.ALIAS }}
           RELEASE_KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
 
-      - name: Collect APKs to flat directory
+      - name: Collect APKs
         run: |
           mkdir -p collected-apks
 
@@ -77,6 +80,16 @@ jobs:
           path: collected-apks/
           if-no-files-found: error
           archive: false
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ github.ref_name }}
+          generate_release_notes: true
+          files: collected-apks/*.apk
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Cleanup
         if: always()
