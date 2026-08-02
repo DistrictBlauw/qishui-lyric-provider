@@ -48,6 +48,7 @@ object QiShui : YukiBaseHooker() {
 
         initProvider()
         hookMediaSession()
+        hookNetCacheLoader()
     }
 
     private fun initProvider() {
@@ -113,6 +114,45 @@ object QiShui : YukiBaseHooker() {
             }
     }
 
+    /**
+     * Hook MD5Util.c(String) 来捕获所有缓存文件名的原始 key 值。
+     *
+     * MD5Util.c(rawKey) 是 NetCacheLoader 计算缓存文件名的唯一入口。
+     * 通过 hook 这个方法，我们可以看到所有写入/读取缓存时的 rawKey 和对应的 md5 文件名，
+     * 从而确定歌词缓存的真实 key 格式。
+     */
+    private fun hookNetCacheLoader() {
+        runCatching {
+            "com.luna.common.secure.MD5Util".toClass()
+                .resolve()
+                .apply {
+                    // c(String) -> String : MD5 of string bytes
+                    firstMethod {
+                        name = "c"
+                        parameters(String::class.java)
+                    }.hook {
+                        after {
+                            val input = args.getOrNull(0) as? String
+                            val output = result as? String
+                            // 只记录看起来像缓存 key 的（包含 "/" 的路径）
+                            if (input != null && (input.contains("/") || input.contains("luna") || input.contains("track"))) {
+                                DebugLogger.log(TAG, "[MD5Util.c] input(rawKey)=$input, output(md5)=$output")
+                                // 将 rawKey -> md5 映射存入缓存
+                                if (input.isNotEmpty() && output != null) {
+                                    rawKeyToMd5Cache[input] = output
+                                }
+                            }
+                        }
+                    }
+                }
+            DebugLogger.log(TAG, "hookNetCacheLoader() hooks installed successfully")
+        }.onFailure {
+            DebugLogger.log(TAG, "hookNetCacheLoader() FAILED to install hooks", it)
+        }
+    }
+
+    /** rawKey -> md5(rawKey) 的映射，用于调试 */
+    private val rawKeyToMd5Cache = mutableMapOf<String, String>()
     private fun updateSongIfNeed() {
         if (curMediaId.isNullOrBlank()) return
         val lastSong = this.lastSong
