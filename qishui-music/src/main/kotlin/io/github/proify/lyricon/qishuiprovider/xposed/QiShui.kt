@@ -122,7 +122,9 @@ object QiShui : YukiBaseHooker() {
             return
         }
 
-        val song = cache.buildSong(id)
+        // 缓存 JSON 中自带 track 元数据，优先用于补全 MediaMetadata 缺失的标题/艺人
+        val metadata = MetadataCache.get(id)
+        val song = cache.buildSong(id, metadata)
         setSong(song)
     }
 
@@ -132,33 +134,60 @@ object QiShui : YukiBaseHooker() {
         lastSong = song
     }
 
-    fun NetResponseCache.buildSong(id: String): Song {
-        val metadata = MetadataCache.get(id)
+    fun NetResponseCache.buildSong(id: String, metadata: Metadata?): Song {
+        // 优先用 MediaSession 元数据，缺失时回退到缓存 JSON 中的 track 字段
+        val trackName = metadata?.title?.takeIf { it.isNotBlank() }
+            ?: track?.name.orEmpty()
+        val trackArtist = metadata?.artist?.takeIf { it.isNotBlank() }
+            ?: track?.artistsText.orEmpty()
+        val trackDuration = metadata?.duration?.takeIf { it != 0L && it != Long.MAX_VALUE }
+            ?: track?.duration ?: 0L
         return Song(
             id = id,
-            name = metadata?.title.orEmpty(),
-            artist = metadata?.artist.orEmpty(),
-            duration = metadata?.duration ?: 0L,
+            name = trackName,
+            artist = trackArtist,
+            duration = trackDuration,
             lyrics = toRichLyric()
         )
     }
 
-    private val netCacheLoaderDir by lazy { appContext!!.cacheDir.resolve("NetCacheLoader") }
+    /**
+     * 候选的 NetCacheLoader 根目录列表。
+     *
+     * 逆向分析（NetCacheLoader.getCacheFilePath）显示缓存根目录取值优先级：
+     *  1. useFilesDir=true  -> getFilesDir()         （本场景 useFilesDir=false，不适用）
+     *  2. ExternalCacheDirConfig=true -> getExternalCacheDir()
+     *  3. 默认 -> getCacheDir()
+     * ExternalCacheDirConfig 默认 false，但为远程可配置项（DeviceConfigManager），
+     * 运行时可能被切换为 true，因此此处同时检查两个候选目录。
+     */
+    private val netCacheLoaderDirs: List<File> by lazy {
+        val ctx = appContext ?: return@lazy emptyList()
+        buildList {
+            ctx.cacheDir.resolve("NetCacheLoader").let { add(it) }
+            runCatching { ctx.externalCacheDir?.resolve("NetCacheLoader") }
+                .getOrNull()?.let { add(it) }
+        }.distinct()
+    }
 
     fun getNetLyricCacheFile(id: String): File? {
         val fileName = calculateLyricCacheFileName(id)
 
         return runCatching {
             var targetFile: File? = null
-            netCacheLoaderDir.listFiles()?.forEach { dir ->
-                if (!dir.isDirectory) return@forEach
-                dir.listFiles()?.forEach { file ->
-                    if (file.isFile && file.name == fileName) {
-                        targetFile = file
-                        return@forEach
+            for (root in netCacheLoaderDirs) {
+                if (!root.isDirectory) continue
+                // 路径结构: {root}/{mUid}/{fileName}（subDir=null 时无额外子目录层）
+                root.listFiles()?.forEach { uidDir ->
+                    if (targetFile != null || !uidDir.isDirectory) return@forEach
+                    uidDir.listFiles()?.forEach { file ->
+                        if (file.isFile && file.name == fileName) {
+                            targetFile = file
+                            return@forEach
+                        }
                     }
                 }
-                if (targetFile != null) return@forEach
+                if (targetFile != null) break
             }
             targetFile
         }.onFailure {
@@ -166,6 +195,14 @@ object QiShui : YukiBaseHooker() {
         }.getOrNull()
     }
 
+    /**
+     * 计算歌词缓存文件名。
+     *
+     * 逆向分析结论（NetCacheLoader + IdCacheKeyProvider）：
+     *  - rawKey = {HTTP 请求路径} + '/' + {trackId}
+     *  - HTTP 路径来自 TrackApi @POST("/luna/track_v2")
+     *  - 文件名 = MD5Util.c(rawKey)，即 rawKey 字节的 32 位小写 MD5
+     */
     fun calculateLyricCacheFileName(id: String): String =
         "/luna/track_v2/$id".md5()
 }
